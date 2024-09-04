@@ -51,9 +51,12 @@ from transition_uncertainty.analysis_utils import calculate_intraclass_correlati
 
 This code is project-specific, and is not intended to be used outside of this project as it refers to directories and files that are specific to this project.
 
-> ⚠ **NOTE**: Setup for this package involves installation of dependency packages with specific versions to ensure replicability. These are relatively up to date as of now (2024), but will become outdated in the future. It may be best to install this package within a virtual environment to avoid conflicts with other packages that are more up to date.
+> [!IMPORTANT]
 >
-> ⚠ **NOTE**: Some of the code used in this project makes use of [Jax](https://jax.readthedocs.io/), which may not run run on Windows. As such, this code can only be assumed to work properly on Linux/MacOS (or Windows using [WSL](https://docs.microsoft.com/en-us/windows/wsl/install-win10))
+> Setup for this package involves installation of dependency packages with specific versions to ensure replicability. These are relatively up to date as of now (2024), but will become outdated in the future. It may be best to install this package within a virtual environment to avoid conflicts with other packages that are more up to date.
+
+> [!IMPORTANT]
+ Some of the code used in this project makes use of [Jax](https://jax.readthedocs.io/), which may not run run on Windows. As such, this code can only be assumed to work properly on Linux/MacOS (or Windows using [WSL](https://docs.microsoft.com/en-us/windows/wsl/install-win10))
 
 ### 📓 Running notebooks
 
@@ -124,8 +127,8 @@ Data and results for the project are stored on the Open Science Framework (OSF) 
 ```bash
 python download_data.py
 ```
-
-> **Note:** This will download the original results for all of the analyses and store them in `./models` and `./results`. These can be overwritten by running the notebooks, which will save the results to the same directory.
+> [!NOTE]
+This will download the original results for all of the analyses and store them in `./models` and `./results`. These can be overwritten by running the notebooks, which will save the results to the same directory.
 
 ## 🔬 Reproducing the analyses
 
@@ -139,7 +142,8 @@ Model fitting is performed using simulation based inference, using a custom [sim
 
 Model fitting using the pre-trained models is performed in the `Model fitting.ipynb` notebooks. This runs the model fitting procedure, estimates parameter values for each participant, and stores the results in the `./results` directory. It also estimates model fit using the WAIC method, allowing for model comparison and providing a measure of model fit for each participant.
 
-> ❔ **NOTE**: The model fitting procedures contained in `scripts/train_sbi.py` will run faster on GPUs. The model comparison procedures are also relatively memory intensive, and may not run on machines with limited memory.
+> [!TIP]
+The model fitting procedures contained in `scripts/train_sbi.py` will run faster on GPUs. The model comparison procedures are also relatively memory intensive, and may not run on machines with limited memory.
 
 ### 2. Analyses of confidence reports
 
