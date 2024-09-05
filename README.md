@@ -2,7 +2,7 @@
 
 _Sookud, Martin, Gillan & Wise (2024)_
 
-🔗 [Preprint]()
+🔗 [Preprint](https://osf.io/preprints/psyarxiv/zp6vk)
 
 This repository contains analysis code for the project looking at how transition learning relates to symptoms of mental health problems.
 
