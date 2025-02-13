@@ -10,6 +10,9 @@ from behavioural_modelling.learning.beta_models import (
     multiply_beta_by_scalar,
     sum_betas,
 )
+from behavioural_modelling.learning.rescorla_wagner import (
+    asymmetric_rescorla_wagner_update,
+)
 from behavioural_modelling.utils import choice_from_action_p
 from numpy.typing import ArrayLike
 
@@ -39,6 +42,455 @@ def softmax_difference(
     softmax_output = jnp.exp(z) / jnp.sum(jnp.exp(z))
 
     return softmax_output
+
+
+def MB_MF_rescorla_wagner_update_choice_wrapper(
+    value_estimate_transition_probs: Tuple[np.ndarray, np.ndarray],
+    choices_states_expected_observed_confidence_key: Tuple[
+        int, np.ndarray, jax.random.PRNGKey
+    ],
+    alpha_p_value: float,
+    alpha_n_value: float,
+    alpha_prob: float,
+    W: float,
+    temperature: float,
+    n_actions: int,  # STATIC
+    simulate: bool,  # STATIC
+) -> np.ndarray:
+    """
+    Wrapper function for model-based/model-free decision-making model with
+    Rescorla-Wagner transition learning to use in jax.lax.scan.
+
+    Assumes a task structure with n starting states and 2 second stage states,
+    whereby each starting state transitions to either of the two second stage
+    states with probabilites specified by the transition_probs argument.
+
+    Args:
+        value_estimate_transition_probs (Tuple[np.ndarray, np.ndarray]): Tuple
+            of estimated first stage state values and transition probabilities
+            (these need to be combined into one argument as scan expects a
+            single argument of variables to iterate over). The current model-free
+            value estimates should be an array of shape (2,), with one entry
+            for each for the left and right option.
+            Current estimate of transition probabilities (i.e., the probability
+            of transitioning to each second stage state from each first stage
+            state) should be a scalar, since there is only a single value
+            to learn as the transition probabilities for the two options
+            are complementary.
+        choices_states_expected_observed_confidence_key (Tuple[float,
+            np.ndarray, int, jax.random.PRNGKey]): Tuple of observed choices,
+            second stage states, rewards and Jax RNG keys (these need to be
+            combined into one argument as scan expects a single argument of
+            variables to iterate over). Choices should be provided as an
+            integer representing the index of the first-stage option chosen;
+            second stage states should be provided as an array indicating which
+            second state each first stage option led to on each trial (with
+            values of 0 or 1 depending on the second stage state observed).
+            Expected and observed rewards should be provided as an array with
+            values for each second stage state. Confidence trial indicators are
+            provided as an array with a single value for each trial indicating
+            which option was available on the confidence trial.
+        alpha_p_value (float): Positive learning rate for value.
+        alpha_n_value (float): Negative learning rate for value.
+        alpha_prob (float): Learning rate for transition probabilities.
+        W (float): Weighting of model-based learning contribution
+            relative to model-free learning.
+        temperature (float):Softmax temperature
+        n_actions (int): Number of actions
+        simulate (bool): Whether to simulate or use observed behaviour.
+            If simulating, outputs are based on simulated choices. If not
+            simulating, outputs are based on observed choices.
+    Returns:
+        np.ndarray: Updated value estimate
+    """
+
+    # Unpack estimates
+    value_estimate, transition_probs = value_estimate_transition_probs
+
+    # Unpack trial outcomes and RNG key
+    (
+        observed_choice,
+        second_stage_states,
+        expected_rewards,
+        observed_rewards,
+        confidence_option,
+        key,
+    ) = choices_states_expected_observed_confidence_key
+
+    # set W on some trials to 0 (i.e., only use MF, as if MB is not available)
+    W_on = jnp.array([expected_rewards[0] < 2]).astype(int)
+
+    # Set expected rewards > 1 to 0
+    expected_rewards = jnp.where(expected_rewards > 1, 0.5, expected_rewards)
+
+    # Get MB value - one for each option (left and right)
+    MB_value = jnp.zeros(2)
+    MB_value = MB_value.at[0].set(
+        (transition_probs * expected_rewards[0])
+        + ((1 - transition_probs) * expected_rewards[1])
+    )
+    MB_value = MB_value.at[1].set(
+        (transition_probs * expected_rewards[1])
+        + ((1 - transition_probs) * expected_rewards[0])
+    )
+
+    # Turn off MB on some trials
+    W = W * W_on
+
+    # Get combined value
+    combined_value = (W * MB_value) + ((1 - W) * value_estimate)
+
+    # Convert from 0-1 to -1 to 1 - seems to improve recoverability
+    combined_value = (combined_value * 2) - 1
+
+    # Get choice probability - using difference seems to work better than
+    # softmax on raw values
+    choice_p = softmax_difference(
+        combined_value[0], combined_value[1], temperature
+    )
+
+    # Make a choice
+    if simulate:
+        choice = choice_from_action_p(key, choice_p, 0)
+    else:
+        choice = observed_choice
+
+    # Determine whether this a confidence trial (1 = confidence, 0 = normal)
+    confidence = jnp.array(confidence_option > -1)
+    # If this is a confidence trial, use the option provided
+    choice = jnp.array(
+        ((1 - confidence) * choice) + (confidence * confidence_option), int
+    )[0]
+
+    # Convert to one-hot format
+    choice_array = jnp.zeros(n_actions, dtype=jnp.int16)
+    choice_array = choice_array.at[choice].set(1)
+
+    # Get outcome
+    observed_second_stage_state = second_stage_states[choice]
+    outcome = observed_rewards[observed_second_stage_state]
+
+    # Get the outcome and update the model-free value estimate
+    updated_value, _ = asymmetric_rescorla_wagner_update(
+        value_estimate,
+        # don't update value on confidence trials
+        (outcome, choice_array * jnp.array(confidence != 1, int)),
+        alpha_p_value,
+        alpha_n_value,
+    )
+
+    # Get the second stage state and transition probability estimates
+    updated_transition_probs, _ = asymmetric_rescorla_wagner_update(
+        transition_probs,
+        # "choice" determines whether we update - using W_on
+        # means that we don't update on broken trials
+        (second_stage_states[0], W_on),
+        alpha_prob,
+        alpha_prob,
+    )
+
+    return (updated_value, updated_transition_probs[0]), (
+        value_estimate,
+        MB_value,
+        transition_probs,
+        choice_p,
+        choice,
+        choice_array,
+    )
+
+
+MB_MF_rescorla_wagner_update_choice_wrapper_jit = jax.jit(
+    MB_MF_rescorla_wagner_update_choice_wrapper,
+    static_argnums=(7, 8),
+)
+
+
+def MB_MF_rescorla_wagner_trial_choice_iterator(
+    key: jax.random.PRNGKey,
+    observed_choices: np.ndarray,
+    second_stage_states: np.ndarray,
+    expected_reward_probs: np.ndarray,
+    observed_rewards: np.ndarray,
+    confidence_options: np.ndarray,
+    n_actions: int,  # STATIC
+    n_trials: int,  # STATIC
+    starting_value_estimate: float = 0.5,
+    starting_transition_prob_estimate: float = 0.5,
+    alpha_p_value: float = 0.5,
+    alpha_n_value: float = 0.5,
+    alpha_prob: float = 0.5,
+    W: float = 0.5,
+    temperature: float = 0.5,
+    simulate: bool = False,  # STATIC
+) -> np.ndarray:
+    """
+    Iterate over trials and update value estimates, generating choices for each
+    trial. Used for model-fitting.
+
+    Args:
+        key (jax.random.PRNGKey): Jax random number generator key
+        outcomes (np.ndarray): Trial outcomes for each bandit of shape
+            (n_trials, n_bandits).
+        choices (np.ndarray)
+        second_stage_states (np.ndarray)
+        expected_reward_probs (np.ndarray): Expected reward probabilities,
+            as a 3D array of shape (n_observations, n_trials, n_bandits).
+        rewards (np.ndarray): Rewards associated with each second stage state.
+            confidence_options (np.ndarray): The option that was available on
+            each confidence trials. Non-confidence trials should be set to -1.
+        n_actions (int, optional): Number of actions.
+        n_trials (int): Number of trials
+        starting_value_estimate (float, optional): Starting value estimate.
+            Defaults to 0.5.
+        starting_transition_prob_estimate (float, optional): Starting estimate
+            for state transition probabilities. Defaults to 1.
+        alpha_p_value (float): Positive learning rate for value.
+        alpha_n_value (float): Negative learning rate for value.
+        alpha_prob (float): Learning rate for transition probabilities.
+        W (float): Weighting of model-based contribution relative to
+            model-free contribution.
+        temperature (float): Softmax temperature
+        simulate (bool): Whether to simulate or use observed behaviour.
+            If simulating, outputs are based on simulated choices.
+            If not simulating, outputs are based on observed choices.
+    Returns:
+        np.ndarray: Value estimates for each trial and each bandit
+    """
+
+    # Use functools.partial to create a function that uses the same parameter
+    # values for all trials
+    MB_MF_rescorla_wagner_update_partial = partial(
+        MB_MF_rescorla_wagner_update_choice_wrapper_jit,
+        alpha_p_value=alpha_p_value,
+        alpha_n_value=alpha_n_value,
+        alpha_prob=alpha_prob,
+        W=W,
+        temperature=temperature,
+        n_actions=n_actions,
+        simulate=simulate,
+    )
+
+    # Initial values for beta dist parameters
+    v_start = jnp.ones((n_actions,)) * starting_value_estimate
+    # Only one transition prob estimate as probabilities are complementary
+    t_start = starting_transition_prob_estimate
+
+    # Jax random keys for choices
+    keys = jax.random.split(key, n_trials)
+
+    # use jax.lax.scan to iterate over trials
+    _, (
+        v,
+        MB_value,
+        t,
+        choice_p,
+        choices,
+        choices_one_hot,
+    ) = jax.lax.scan(
+        MB_MF_rescorla_wagner_update_partial,
+        (v_start, t_start),
+        (
+            observed_choices,
+            second_stage_states,
+            expected_reward_probs,
+            observed_rewards,
+            confidence_options,
+            keys,
+        ),
+    )
+
+    return (
+        v,
+        t,
+        MB_value,
+        choice_p,
+        choices,
+        choices_one_hot,
+    )
+
+
+# Set up jax JIT and vmaps
+MB_MF_rescorla_wagner_trial_choice_iterator_jit = jax.jit(
+    MB_MF_rescorla_wagner_trial_choice_iterator, static_argnums=(6, 7, 15)
+)
+
+# Vmap to iterate over blocks
+MB_MF_rescorla_wagner_simulate_vmap_blocks = jax.vmap(
+    MB_MF_rescorla_wagner_trial_choice_iterator_jit,
+    in_axes=(
+        None,
+        0,
+        0,
+        0,
+        0,
+        0,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    ),
+)
+
+# Vmap to iterate over observations (subjects)
+MB_MF_rescorla_wagner_simulate_vmap_observations = jax.vmap(
+    MB_MF_rescorla_wagner_simulate_vmap_blocks,
+    in_axes=(0, 0, 0, 0, 0, 0, None, None, 0, 0, 0, 0, 0, 0, 0, None),
+)
+
+
+def simulate_rescorla_wagner_transition_learner(
+    alpha_p_value: np.ndarray,
+    alpha_n_value: np.ndarray,
+    alpha_prob: np.ndarray,
+    W: np.ndarray,
+    temperature: np.ndarray,
+    starting_value_estimate: float,
+    starting_transition_prob_estimate: float,
+    second_stage_states: np.ndarray,
+    expected_reward_probs: np.ndarray,
+    rewards: np.ndarray,
+    confidence_options: np.ndarray,
+    observed_choices: np.ndarray = None,
+    choice_format: str = "index",
+    seed: int = 42,
+) -> Tuple[
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+]:
+    """
+    Simulate choices a multi-armed bandit task with n_bandits arms.
+
+    Note that the starting estimates are not used and are included for
+    compatibility with other functions. Instead, starting estimates
+    are set to 0.5.
+
+    Args:
+        alpha_p_value (np.ndarray): Positive learning rate for value.
+        alpha_n_value (np.ndarray): Negative learning rate for value.
+        alpha_prob (np.ndarray): Learning rate for transition probabilities.
+        W (float): Weighting of model-based and model-free learning.
+        temperature (float): Softmax temperature
+        starting_value_estimate (float): Starting value estimate.
+        starting_transition_prob_estimate (float): Starting estimate for
+            state transition probabilities.
+        second_stage_states (np.ndarray): Second stage states for each trial.
+        expected_reward_probs (np.ndarray): Expected reward probabilities.
+        rewards (np.ndarray): Rewards associated with each second stage state.
+        confidence_options (np.ndarray): The option that was available on
+            each confidence trials. Non-confidence trials should be set to -1.
+        observed_choices (np.ndarray, optional): Observed choices. If None,
+            choices are simulated. Defaults to None.
+        choice_format (str, optional): Format of choices. One of 'index' or
+            'one_hot'. Defaults to 'index'.
+        seed (int, optional): Random seed. Defaults to 42.
+
+    Returns:
+        Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray,
+        np.ndarray, np.ndarray]: Choice probabilities, choices, value
+        estimates, transition estimates, mean value estimates, model-based
+        value estimates, combined value estimates, variance weighting.
+    """
+    assert (
+        alpha_p_value.shape
+        == alpha_n_value.shape
+        == alpha_prob.shape
+        == W.shape
+        == temperature.shape
+    ), "All parameters should have the same shape, but got"
+    " {0}, {1}, {2}, {3}, {4}".format(
+        alpha_p_value.shape,
+        alpha_n_value.shape,
+        alpha_prob.shape,
+        W.shape,
+        temperature.shape,
+    )
+
+    # Extract dimensions
+    _, n_blocks, n_trials, n_bandits = second_stage_states.shape
+    n_observations = alpha_p_value.shape[0]
+
+    # Get starting value and transition probability estimates
+    starting_value_estimate = jnp.ones_like(alpha_p_value) * 0.5
+    starting_transition_prob_estimate = jnp.ones_like(alpha_p_value) * 0.5
+
+    # If choices is None, create an array of zeros for choices and set simulate
+    # to True
+    if observed_choices is None:
+        observed_choices = np.zeros(
+            (n_observations, n_blocks, n_trials), dtype=int
+        )
+        simulate = True
+    else:
+        simulate = False
+
+    # Run simulation
+    key = jax.random.PRNGKey(seed)
+    keys = jax.random.split(key, n_observations)
+
+    (
+        value_estimates,
+        transition_estimates,
+        MB_value,
+        choice_p,
+        choices,
+        choices_one_hot,
+    ) = MB_MF_rescorla_wagner_simulate_vmap_observations(
+        keys,
+        observed_choices,
+        second_stage_states,
+        expected_reward_probs,
+        rewards,
+        confidence_options,
+        n_bandits,
+        n_trials,
+        starting_value_estimate,
+        starting_transition_prob_estimate,
+        alpha_p_value,
+        alpha_n_value,
+        alpha_prob,
+        W,
+        temperature,
+        simulate,
+    )
+
+    # Output format here is designed to be
+    # consistent with beta model, hence
+    # some outputs are set to None
+    if choice_format == "one_hot":
+        return (
+            choice_p,
+            choices_one_hot,
+            value_estimates,
+            transition_estimates,
+            None,
+            MB_value,
+            None,
+            None,
+            None,
+        )
+    elif choice_format == "index":
+        return (
+            choice_p,
+            choices,
+            value_estimates,
+            transition_estimates,
+            None,
+            MB_value,
+            None,
+            None,
+            None,
+        )
 
 
 def MB_MF_beta_update_choice_wrapper(
@@ -74,14 +526,16 @@ def MB_MF_beta_update_choice_wrapper(
             single argument of variables to iterate over). Current model-free
             value estimate are represented by the alpha and beta parameters of
             a beta distribution. An array of shape (2, 2), where the first
-            dimension represents the second stage state and the second
+            dimension represents the option (left or right) and the second
             dimension represents the beta distribution parameters. Current
             estimate of transition probabilities (i.e., the probability of
             transitioning to each second stage state from each first stage
             state), represented by the alpha and beta parameters of a beta
-            distribution. An array of shape (4, 2), where the first dimension
-            represents the first stage state and the second dimension
-            represents the beta distribution parameters.
+            distribution. An array of shape (1, 2), where the first dimension
+            represents the first stage state (we have only a single entry
+            for this since participants are instructed that the probabilities
+            associated with each option are complementary) and the second
+            dimension represents the beta distribution parameters.
         choices_states_expected_observed_confidence_key (Tuple[float,
             np.ndarray, int, jax.random.PRNGKey]): Tuple of observed choices,
             second stage states, rewards and Jax RNG keys (these need to be
@@ -97,14 +551,14 @@ def MB_MF_beta_update_choice_wrapper(
             which option was available on the confidence trial.
         tau_p_value (float): Positive update rate for value.
         tau_n_value (float): Negative update rate for value.
-        tau_prob (float): Update rate for transition probabilities. 
-        decay_value (float):Decay rate for value. 
+        tau_prob (float): Update rate for transition probabilities.
+        decay_value (float):Decay rate for value.
         decay_prob (float): Decay rate for transition probabilities.
-        W (float): Weighting of model-based learning contribution 
-            relative to model-free learning. 
-        temperature (float):Softmax temperature 
-        n_actions (int): Number of actions 
-        simulate (bool): Whether to simulate or use observed behaviour. 
+        W (float): Weighting of model-based learning contribution
+            relative to model-free learning.
+        temperature (float):Softmax temperature
+        n_actions (int): Number of actions
+        simulate (bool): Whether to simulate or use observed behaviour.
             If simulating, outputs are based on simulated choices. If not
             simulating, outputs are based on observed choices.
     Returns:
@@ -229,7 +683,7 @@ def MB_MF_beta_update_choice_wrapper(
     ).T
 
     # Convert from 0-1 to -1 to 1 - seems to improve recoverability
-    combined_value = (combined_value * 1) - 1
+    combined_value = (combined_value * 2) - 1
 
     # Get choice probability - using difference seems to work better than
     # softmax on raw values
@@ -282,7 +736,7 @@ def MB_MF_beta_update_choice_wrapper(
         update=jnp.array(
             second_stage_states[1] != 2, int
         ),  # allows for updating to be turned off
-        increment=W_on,
+        increment=W_on,  # don't increment on broken trials
     )
 
     return (updated_value, updated_transition_probs), (
@@ -331,21 +785,21 @@ def MB_MF_beta_trial_choice_iterator(
 
     Args:
         key (jax.random.PRNGKey): Jax random number generator key
-        outcomes (np.ndarray): Trial outcomes for each bandit of shape 
-            (n_trials, n_bandits). 
+        outcomes (np.ndarray): Trial outcomes for each bandit of shape
+            (n_trials, n_bandits).
         choices (np.ndarray)
         second_stage_states (np.ndarray)
-        expected_reward_probs (np.ndarray): Expected reward probabilities, 
+        expected_reward_probs (np.ndarray): Expected reward probabilities,
             as a 3D array of shape (n_observations, n_trials, n_bandits).
         rewards (np.ndarray): Rewards associated with each second stage state.
             confidence_options (np.ndarray): The option that was available on
             each confidence trials. Non-confidence trials should be set to -1.
         n_actions (int, optional): Number of actions.
         n_trials (int): Number of trials
-        starting_value_estimate (float, optional): Starting value estimate 
+        starting_value_estimate (float, optional): Starting value estimate
             (i.e., the starting value of the A and B parameters
             of a beta distribution). Defaults to 1.
-        starting_transition_prob_estimate (float, optional): Starting estimate 
+        starting_transition_prob_estimate (float, optional): Starting estimate
             for state transition probabilities (i.e., the starting value of the
             A and B parameters of a beta distribution). Defaults to 1.
         tau_p_value (float): Positive update rate for value.
@@ -353,10 +807,10 @@ def MB_MF_beta_trial_choice_iterator(
         tau_prob (float): Update rate for transition probabilities.
         decay_value (float): Decay rate for value.
         decay_prob (float): Decay rate for transition probabilities.
-        W (float): Weighting of model-based contribution relative to 
+        W (float): Weighting of model-based contribution relative to
             model-free contribution.
         temperature (float): Softmax temperature
-        simulate (bool): Whether to simulate or use observed behaviour. 
+        simulate (bool): Whether to simulate or use observed behaviour.
             If simulating, outputs are based on simulated choices.
             If not simulating, outputs are based on observed choices.
     Returns:
@@ -494,12 +948,28 @@ def simulate_leaky_beta_transition_learner(
 
     Args:
         tau_p_value (float): Positive update rate for value.
-        tau_n_value (float): Negative update rate for value. 
-        tau_prob (float): Update rate for transition probabilities. 
-        decay_value (float): Decay rate for value. 
-        decay_prob (float): Decay rate for transition probabilities. W
-        (float): Weighting of model-based and model-free learning. temperature
-        (float): Softmax temperature
+        tau_n_value (float): Negative update rate for value.
+        tau_prob (float): Update rate for transition probabilities.
+        decay_value (float): Decay rate for value.
+        decay_prob (float): Decay rate for transition probabilities.
+        W (float): Weighting of model-based and model-free learning.
+        temperature (float): Softmax temperature
+        starting_value_estimate (float): Starting values for the beta
+            distribution parameters for value estimates.
+        starting_transition_prob_estimate (float): Starting estimate for
+            the beta distribution parameters for the transition
+            probabilities.
+        second_stage_states (np.ndarray): Second stage states for each trial
+            and each first stage option.
+        expected_reward_probs (np.ndarray): Expected reward probabilities.
+        rewards (np.ndarray): Rewards associated with each second stage state.
+        confidence_options (np.ndarray): The option that was available on
+            each confidence trials. Non-confidence trials should be set to -1.
+        observed_choices (np.ndarray, optional): Observed choices. If None,
+            choices are simulated. Defaults to None.
+        choice_format (str, optional): Choice format. Either "index" or
+            "one_hot". Defaults to "index".
+        seed (int, optional): Random seed. Defaults to 42.
 
     Returns:
         Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray,

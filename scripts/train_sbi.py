@@ -7,6 +7,18 @@ from transition_uncertainty.model_fit_utils import (
 from transition_uncertainty.modelling_utils import (
     generate_simulation_parameters,
 )
+import tensorflow as tf
+import keras
+
+# Set the seed using keras.utils.set_random_seed. This will set:
+# 1) `numpy` seed
+# 2) backend random seed
+# 3) `python` random seed
+keras.utils.set_random_seed(42)
+
+# If using TensorFlow, this will make GPU ops as deterministic as possible,
+# but it will affect the overall performance, so be mindful of that.
+tf.config.experimental.enable_op_determinism()
 
 if __name__ == "__main__":
     # Initialize argument parser and add arguments
@@ -44,7 +56,6 @@ if __name__ == "__main__":
 
     # Parameters that are common across all model types
     common_params = [
-        params_dict["temperature"],
         starting_value_estimate,
         starting_transition_prob_estimate,
         second_stage_states_all,
@@ -55,18 +66,34 @@ if __name__ == "__main__":
 
     # Configuration dictionary providing mapping between model types and their
     # specific configurations.
+    # These parameters will be the target for model training.
     model_configurations = {
         "mf_only": {
+            # Tau value, lambda value, and temperature
             "true_params_subset": true_params_array[:, [0, 2, 5]],
         },
         "mb_only": {
+            # Tau prob, lambda prob, and temperature
             "true_params_subset": true_params_array[:, [1, 3, 5]],
         },
         "weighting": {
-            "true_params_subset": true_params_array,
+            # Tau value, tau prob, lambda value, lambda prob, weighting, temperature
+            "true_params_subset": true_params_array[:, [0, 1, 2, 3, 4, 5]],
         },
-        "weighting_fixed": {
-            "true_params_subset": true_params_array[:, [0, 1, 2, 3, 5]],
+        # "weighting_fixed": {
+        #     "true_params_subset": true_params_array[:, [0, 1, 2, 3, 5]],
+        # },
+        "rw_mf_only": {
+            # Alpha value, temperature
+            "true_params_subset": true_params_array[:, [6, 7]],
+        },
+        "rw_mb_only": {
+            # Alpha prob, temperature
+            "true_params_subset": true_params_array[:, [7, 8]],
+        },
+        "rw_weighting": {
+            # Alpha value, alpha prob, weighting, temperature
+            "true_params_subset": true_params_array[:, [6, 7, 4, 8]],
         },
     }
 

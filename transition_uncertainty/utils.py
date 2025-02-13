@@ -21,9 +21,13 @@ def check_directories():
     """
     # Check if the 'notebooks' directory exists
     if not os.path.isdir("notebooks"):
+        # If we're in the notebooks directory, go one up
+        if os.path.isdir('discovery'):        
+            print("Changing directory to root directory of repository...")
+            os.chdir("..")
         # If we're currently in a subdirectory of the "notebooks", move
         # two directories up
-        if os.path.isdir("../../notebooks"):
+        elif os.path.isdir("../../notebooks"):
             print("Changing directory to root directory of repository...")
             os.chdir("../..")
         else:

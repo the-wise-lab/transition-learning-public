@@ -12,7 +12,10 @@ import pandas as pd
 from joblib import Parallel, delayed
 from tqdm import tqdm
 
-from .beta_models import simulate_leaky_beta_transition_learner
+from .beta_models import (
+    simulate_leaky_beta_transition_learner,
+    simulate_rescorla_wagner_transition_learner,
+)
 from .utils import tqdm_joblib
 
 os.environ["OUTDATED_IGNORE"] = "1"
@@ -177,7 +180,10 @@ def generate_simulation_parameters(
     decay_value = rng.uniform(0, 1, size=n_subs)
     decay_prob = rng.uniform(0, 1, size=n_subs)
     W = rng.uniform(0.1, 0.9, size=n_subs)
-    temperature = rng.uniform(0.01, 0.2, size=n_subs)
+    temperature = rng.uniform(0.05, 0.2, size=n_subs)
+    alpha_value = rng.uniform(0, 1, size=n_subs)
+    alpha_prob = rng.uniform(0, 1, size=n_subs)
+    temperature_rw = rng.uniform(0.05, 0.2, size=n_subs) * 5
 
     # Put into a dictionary to return
     params_dict = {
@@ -187,6 +193,9 @@ def generate_simulation_parameters(
         "decay_prob": decay_prob,
         "W": W,
         "temperature": temperature,
+        "alpha_value": alpha_value,
+        "alpha_prob": alpha_prob,
+        "temperature_rw": temperature_rw,
     }
 
     # Define fixed starting values for simulations
@@ -201,7 +210,10 @@ def generate_simulation_parameters(
             decay_value,
             decay_prob,
             transform_from_bounded(W, 0.1, 0.9),
-            transform_from_bounded(temperature, 0.01, 0.2),
+            transform_from_bounded(temperature, 0.05, 0.2),
+            alpha_value,
+            alpha_prob,
+            transform_from_bounded(temperature_rw, 0.2, 1.0),
         ]
     ).T
 
@@ -227,25 +239,27 @@ def get_simulation_params(
     """
     Get simulation parameters based on the model type.
 
-    Args:
-        model_type (str): Type of the model to simulate.
-        params_dict (dict): Dictionary containing parameter values.
-        W_like (np.ndarray): A numpy array to derive shapes for
-            creating arrays of ones and zeros.
-        common_params (list): Parameters common across all model types. These
-            are entered into the simulation call after the other values.
-            Generally, these should correspond to: [temperature,
-            starting_value_estimate, starting_transition_prob_estimate,
-            second_stage_states_all, reward_probs_all, rewards_all,
-            available_side_all]
-
-    Returns:
-        list: Simulation parameters assembled based on the model type.
-
     This function takes a model type as input and uses it to decide which
     parameters to prepare and return for the simulation. The returned list of
     parameters will be used to simulate the specified model type in the later
     stages of the program.
+
+    Args:
+        model_type (str): Type of the model to simulate.
+        params_dict (dict): Dictionary containing parameter values.
+            This should contain all parameters for all models. The dictionary
+            should contain the parameter names as keys and the parameter values
+            as values.
+        W_like (np.ndarray): A numpy array to derive shapes for
+            creating arrays of ones and zeros.
+        common_params (list): Parameters common across all model types. These
+            are entered into the simulation call after the other values.
+            Generally, these should correspond to: [starting_value_estimate,
+            starting_transition_prob_estimate, second_stage_states_all,
+            reward_probs_all, rewards_all, available_side_all]
+
+    Returns:
+        list: Simulation parameters assembled based on the model type.
     """
 
     # Only using model-free value learning
@@ -257,6 +271,7 @@ def get_simulation_params(
             params_dict["decay_value"],
             np.ones_like(W_like) * 0,
             np.ones_like(W_like) * 0,
+            params_dict["temperature"],
         ] + common_params
 
     # Only using model-based decision-making based on learnt transition
@@ -269,6 +284,7 @@ def get_simulation_params(
             np.ones_like(W_like) * 0,
             params_dict["decay_prob"],
             np.ones_like(W_like) * 1,
+            params_dict["temperature"],
         ] + common_params
 
     # Combining MF and MB according to weighting parameter W
@@ -280,6 +296,7 @@ def get_simulation_params(
             params_dict["decay_value"],
             params_dict["decay_prob"],
             params_dict["W"],
+            params_dict["temperature"],
         ] + common_params
 
     # Taking the simple average of MF and MB (W = 0.5)
@@ -291,10 +308,39 @@ def get_simulation_params(
             params_dict["decay_value"],
             params_dict["decay_prob"],
             np.ones_like(W_like) * 0.5,
+            params_dict["temperature"],
+        ] + common_params
+
+    elif model_type == "rw_mf_only":
+        return [
+            params_dict["alpha_value"],
+            params_dict["alpha_value"],
+            np.ones_like(W_like) * 0,
+            np.ones_like(W_like) * 0,
+            params_dict["temperature_rw"],
+        ] + common_params
+
+    elif model_type == "rw_mb_only":
+        return [
+            np.ones_like(W_like) * 0,
+            np.ones_like(W_like) * 0,
+            params_dict["alpha_prob"],
+            np.ones_like(W_like) * 1,
+            params_dict["temperature_rw"],
+        ] + common_params
+
+    elif model_type == "rw_weighting":
+        return [
+            params_dict["alpha_value"],
+            params_dict["alpha_value"],
+            params_dict["alpha_prob"],
+            params_dict["W"],
+            params_dict["temperature_rw"],
         ] + common_params
 
 
 def calculate_waic(
+    model: str,
     sampled_params: np.ndarray,
     second_stage_states: np.ndarray,
     rewards: np.ndarray,
@@ -312,6 +358,7 @@ def calculate_waic(
     of the data, which is used to calculate the WAIC.
 
     Args:
+        model (str): The name of the model.
         sampled_params (np.ndarray): Array of shape (n_samples, n_subjects,
             n_params) containing parameter samples.
         second_stage_states (np.ndarray): Array of shape
@@ -390,26 +437,46 @@ def calculate_waic(
 
     # Simulate data using parameter samples
     # This is necessary to get the logp of the data
-    choice_p, _, _, _, _, _, _, _, _ = simulate_leaky_beta_transition_learner(
-        sampled_params_reshaped[:, 0],
-        sampled_params_reshaped[:, 0],
-        sampled_params_reshaped[:, 1],
-        sampled_params_reshaped[:, 2],
-        sampled_params_reshaped[:, 3],
-        sampled_params_reshaped[:, 4],
-        sampled_params_reshaped[:, 5],
-        starting_value_estimate,
-        starting_transition_prob_estimate,
-        second_stage_states_all,
-        reward_probs_all,
-        rewards_all,
-        available_side_all,
-        observed_choices=test_choices_all,
-    )
+    if "rw_" in model:
+        choice_p, _, _, _, _, _, _, _, _ = (
+            simulate_rescorla_wagner_transition_learner(
+                sampled_params_reshaped[:, 0],
+                sampled_params_reshaped[:, 0],
+                sampled_params_reshaped[:, 1],
+                sampled_params_reshaped[:, 2],
+                sampled_params_reshaped[:, 3],
+                starting_value_estimate,
+                starting_transition_prob_estimate,
+                second_stage_states_all,
+                reward_probs_all,
+                rewards_all,
+                available_side_all,
+                observed_choices=test_choices_all,
+            )
+        )
+    else:
+        choice_p, _, _, _, _, _, _, _, _ = (
+            simulate_leaky_beta_transition_learner(
+                sampled_params_reshaped[:, 0],
+                sampled_params_reshaped[:, 0],
+                sampled_params_reshaped[:, 1],
+                sampled_params_reshaped[:, 2],
+                sampled_params_reshaped[:, 3],
+                sampled_params_reshaped[:, 4],
+                sampled_params_reshaped[:, 5],
+                starting_value_estimate,
+                starting_transition_prob_estimate,
+                second_stage_states_all,
+                reward_probs_all,
+                rewards_all,
+                available_side_all,
+                observed_choices=test_choices_all,
+            )
+        )
 
     # remove any parameters where values are the same for all observations
     sampled_params = sampled_params[
-        ..., ~(sampled_params.reshape(-1, 6).std(axis=0) == 0)
+        ..., ~(sampled_params.reshape(-1, n_parameters).std(axis=0) == 0)
     ]
 
     # Reshape choice probability to be samples x ...
@@ -418,10 +485,18 @@ def calculate_waic(
     choice_p = choice_p[..., available_side[0, :] == -1, :]
     test_choices_all = test_choices_all[..., available_side[0, :] == -1]
 
+    # Check that we don't have any NaNs in choice probabilities
+    assert np.isfinite(choice_p).all(), (
+        "NaNs or infs in choice probabilities, model = " + model
+    )
+
     # Get pointwise log likelihood
     log_likelihood = dist.Bernoulli(probs=choice_p[..., 1]).log_prob(
         test_choices_all
     )
+
+    # Check for NaNs/infs in log likelihood
+    assert np.isfinite(log_likelihood).all(), "NaNs or infs in log likelihood"
 
     # Reshape so that the log likelihood shape is (1, n_samples, n_subjects,
     # n_trials)
@@ -446,10 +521,14 @@ def calculate_waic(
         warnings.simplefilter("ignore")
         waic = az.waic(dataset, pointwise=pointwise)
 
+        # Check for NaNs/infs in WAIC
+        assert np.isfinite(waic.waic_i).all(), "NaNs or infs in WAIC"
+
     return dataset, waic
 
 
 def simulate_from_mean_params(
+    model: str,
     mean_params: np.ndarray,
     second_stage_states: np.ndarray,
     rewards: np.ndarray,
@@ -457,9 +536,10 @@ def simulate_from_mean_params(
     available_side: np.ndarray,
 ) -> Tuple[jnp.array, jnp.array, jnp.array]:
     """
-    Simulates data given mean parameter estimates.
+    Simulates data given mean parameter estimates for the beta model.
 
     Args:
+        model (str): The name of the model.
         mean_params (np.ndarray): Array of shape (n_subjects, n_params)
             containing parameter estimates.
         second_stage_states (np.ndarray): Array of shape
@@ -539,8 +619,12 @@ def simulate_from_mean_params(
         mean_params[:, 1],
         mean_params[:, 2],
         mean_params[:, 3],
-        transform_to_bounded(mean_params[:, 4], 0.1, 0.9),
-        transform_to_bounded(mean_params[:, 5], 0.01, 0.2),
+        (
+            transform_to_bounded(mean_params[:, 4], 0.1, 0.9)
+            if "weighting" in model
+            else mean_params[:, 4]
+        ),
+        transform_to_bounded(mean_params[:, 5], 0.05, 0.2),
         starting_value_estimate,
         starting_transition_prob_estimate,
         second_stage_states_all,
@@ -559,9 +643,13 @@ def simulate_model_with_params(
     common_params: List[Union[float, np.ndarray]],
     remove_confidence_trials: bool = False,
     random_seed: int = 42,
-) -> None:
+) -> np.ndarray:
     """
     Train and save a model with specified parameters.
+
+    This function performs the following steps: - Computes the simulation
+    parameters for the specified model type by calling `get_simulation_params`.
+    - Simulates data using the parameters.
 
     Args:
         model_type (str): Type of the model to simulate and save.
@@ -571,18 +659,17 @@ def simulate_model_with_params(
             containing the available side on each trial for each subject.
         common_params (list): Parameters common across all model types. These
             are entered into the simulation call after the other values.
-            Generally, these should correspond to: [temperature,
-            starting_value_estimate, starting_transition_prob_estimate,
-            second_stage_states_all, reward_probs_all, rewards_all,
-            available_side_all]
+            Generally, these should correspond to: starting_value_estimate,
+            starting_transition_prob_estimate, second_stage_states_all,
+            reward_probs_all, rewards_all, available_side_all]
         remove_confidence_trials (bool, optional): Whether to remove confidence
             trials from the simulated data. Defaults to False.
         random_seed (int, optional): Seed for random number generator.
             Default is 42.
 
-    This function performs the following steps: - Computes the simulation
-    parameters for the specified model type by calling `get_simulation_params`.
-    - Simulates data using the parameters.
+    Returns:
+        np.ndarray: Array of shape (n_subs, n_trials, n_options) containing the simulated
+            choices.
     """
 
     # Get the simulation parameters for the specified model type
@@ -591,9 +678,18 @@ def simulate_model_with_params(
     )
 
     # Call the simulation function
-    _, choices, _, _, _, _, _, _, _ = simulate_leaky_beta_transition_learner(
-        *simulate_params, seed=random_seed
-    )
+    if "rw" in model_type:
+        _, choices, _, _, _, _, _, _, _ = (
+            simulate_rescorla_wagner_transition_learner(
+                *simulate_params, seed=random_seed
+            )
+        )
+    else:
+        _, choices, _, _, _, _, _, _, _ = (
+            simulate_leaky_beta_transition_learner(
+                *simulate_params, seed=random_seed
+            )
+        )
 
     # Optionally remove confidence trials
     if remove_confidence_trials:
@@ -718,6 +814,19 @@ def map_sampled_params(
     elif model == "weighting":
         mapped_params = params
 
+    elif model == "rw_mf_only":
+        mapped_params[..., 0] = params[..., 0]
+        mapped_params[..., 2] = 0
+        mapped_params[..., 3] = params[..., 1]
+
+    elif model == "rw_mb_only":
+        mapped_params[..., 1] = params[..., 0]
+        mapped_params[..., 2] = 1
+        mapped_params[..., 3] = params[..., 1]
+
+    elif model == "rw_weighting":
+        mapped_params = params
+
     else:
         raise ValueError(f"Unknown model: {model}")
 
@@ -762,11 +871,10 @@ def run_combination(
     Returns:
         pd.DataFrame: DataFrame containing results for the particular
             combination.
-
-    Note:
-        Ensure all functions called within have appropriate definitions and
-        imports in your script.
     """
+    # Check there are no nans/infs in the simulated data
+    assert np.isfinite(simulated_data).all(), "NaNs/infs in simulated data"
+
     # Sample parameters from the trained estimation model.
     sampled_params = estimation_trained_model.sample(
         simulated_data[
@@ -784,15 +892,35 @@ def run_combination(
     )
 
     # Transform parameters from the range [0, 1] to their original ranges.
-    sampled_params[..., 4] = transform_to_bounded(
-        sampled_params[..., 4], 0.1, 0.9
-    )
-    sampled_params[..., 5] = transform_to_bounded(
-        sampled_params[..., 5], 0.01, 0.2
+    if "rw_" in estimation_model:
+        # Weighting
+        if "weighting" in estimation_model:
+            sampled_params[..., 2] = transform_to_bounded(
+                sampled_params[..., 2], 0.1, 0.9
+            )
+        # Temperature
+        sampled_params[..., 3] = transform_to_bounded(
+            sampled_params[..., 3], 0.2, 1.0
+        )
+    else:
+        # Weighting
+        if "weighting" in estimation_model:
+            sampled_params[..., 4] = transform_to_bounded(
+                sampled_params[..., 4], 0.1, 0.9
+            )
+        # Temperature
+        sampled_params[..., 5] = transform_to_bounded(
+            sampled_params[..., 5], 0.05, 0.2
+        )
+
+    # Check there are no nans/infs in the sampled parameters
+    assert np.isfinite(sampled_params).all(), (
+        "NaNs/infs in sampled parameters, model = " + estimation_model
     )
 
     # Calculate WAIC and get dataset
     ds, waic = calculate_waic(
+        estimation_model,
         sampled_params,
         second_stage_states_all[0, ...],
         rewards_all[0, ...],
@@ -846,9 +974,6 @@ def run_model_recovery(
     Returns:
         pd.DataFrame: DataFrame containing results from the model recovery.
 
-    Note:
-        Ensure all functions called within have appropriate definitions and
-        imports in your script.
     """
 
     # Calculate how many subjects to simulate based on iterations and subjects
@@ -869,14 +994,20 @@ def run_model_recovery(
     ) = generate_simulation_parameters(n_subs_simulate, task_spec_path)
 
     # Specify models
-    models = ["mf_only", "mb_only", "weighting", "weighting_fixed"]
+    models = [
+        "mf_only",
+        "mb_only",
+        "weighting",
+        "rw_mf_only",
+        "rw_mb_only",
+        "rw_weighting",
+    ]
 
     # Dictionary to store simulated data
     simulated_data_dict = {}
 
     # Parameters that are common across all model types
     common_params = [
-        params_dict["temperature"],
         starting_value_estimate,
         starting_transition_prob_estimate,
         second_stage_states_all,
@@ -889,6 +1020,10 @@ def run_model_recovery(
     for model in models:
         simulated_data_dict[model] = simulate_model_with_params(
             model, params_dict, available_side, common_params, random_seed=100
+        )
+        # Check there are no nans/infs in the simulated data
+        assert np.isfinite(simulated_data_dict[model]).all(), (
+            "***NaNs/infs in simulated data, model = " + model
         )
 
     # Load estimation models from trained_model_dir

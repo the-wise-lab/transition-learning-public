@@ -23,19 +23,19 @@ def load_and_process_data(
 
     Args:
         sample (str): The type of sample to load ('discovery', 'replication',
-            'follow-up', 'follow-up-1yr', 'retest'). 
-        scale (bool): Whether to scale the data. Defaults to True. 
+            'follow-up', 'follow-up-1yr', 'retest').
+        scale (bool): Whether to scale the data. Defaults to True.
         transform (bool): Whether to transform the variance variable.
-            Defaults to True. 
-        include_confidence (bool): Whether to include confidence data. 
-            Defaults to True. 
-        include_questionnaire (bool): Whether to include questionnaire data. 
+            Defaults to True.
+        include_confidence (bool): Whether to include confidence data.
+            Defaults to True.
+        include_questionnaire (bool): Whether to include questionnaire data.
             Defaults to True. include_factor
-        (bool): Whether to include factor data. Defaults to True. 
+        (bool): Whether to include factor data. Defaults to True.
         include_param (bool): Whether to include param data. Defaults to True.
         include_performance (bool): Whether to include performance data.
-            Defaults to True. 
-        retain_unscaled (List[str], optional): List of columns to retain 
+            Defaults to True.
+        retain_unscaled (List[str], optional): List of columns to retain
             in the unscaled DataFrame. For these columns, values will be scaled
             (if scale == True), but an additional column will be created with
             the suffix "_unscaled" which retains the unscaled data. Defaults to
@@ -197,3 +197,90 @@ def load_and_process_data(
     print(f"Number of subjects after filtering and processing: {len(qdata)}")
 
     return qdata
+
+
+def make_task_switching_data(
+    data: pd.DataFrame,
+    second_stage_state_probs: np.ndarray = None,
+) -> pd.DataFrame:
+    """
+    Preprocesses task data by creating new columns ('stay', 'rewarded',
+    'common') and filtering for specific conditions.
+
+    Args:
+        data (pd.DataFrame): The input DataFrame containing subject task data.
+        second_stage_state_probs (np.ndarray, Optional): Array of state
+            probabilities used for filtering. If not provided, data is not
+            filtered. This is required for the modified but not the original
+            Cannon Blast task.
+
+    Returns:
+        pd.DataFrame: A cleaned and preprocessed DataFrame with new columns and
+            filters applied.
+    """
+
+    # Copy and sort the data
+    task_df = data.copy()
+    task_df = task_df.sort_values(by=["subjectID", "trial"])
+
+    # Get number of subjects
+    n_subjects = len(task_df["subjectID"].unique())
+
+    # Create 'stay' column: 1 if response is the same as the previous trial, 0 otherwise
+    task_df["stay"] = (
+        task_df.groupby("subjectID")["response"].shift(-1)
+        == task_df["response"]
+    ).astype(int)
+
+    # Drop the last trial for each subject
+    task_df = (
+        task_df.groupby("subjectID")
+        .apply(lambda x: x.iloc[:-1])
+        .reset_index(drop=True)
+    )
+
+    # Create 'rewarded' column: -1 if 'exploded', 1 otherwise
+    task_df["rewarded"] = (
+        task_df["exploded"].replace({False: 1, True: -1}).astype(int)
+    )
+
+    # Add transition probabilities column
+    if second_stage_state_probs is not None:
+        task_df["transition_probability"] = np.tile(
+            second_stage_state_probs[:-1, 0], n_subjects
+        )
+
+        # Filter rows for clear common/rare transitions
+        task_df = task_df[
+            (task_df["transition_probability"] < 0.2)
+            | (task_df["transition_probability"] > 0.8)
+        ]
+
+    # Create 'common' column based on ballColour and response
+    task_df["common"] = (
+        (
+            (task_df["ballColour"] == "pink")
+            & (task_df["response"] == 1)
+            & (task_df["transition_probability"] < 0.5)
+        )
+        | (
+            (task_df["ballColour"] == "purple")
+            & (task_df["response"] == 2)
+            & (task_df["transition_probability"] < 0.5)
+        )
+        | (
+            (task_df["ballColour"] == "pink")
+            & (task_df["response"] == 2)
+            & (task_df["transition_probability"] > 0.5)
+        )
+        | (
+            (task_df["ballColour"] == "purple")
+            & (task_df["response"] == 1)
+            & (task_df["transition_probability"] > 0.5)
+        )
+    ).astype(int)
+
+    # Replace 'common' 0 values with -1
+    task_df["common"] = task_df["common"].replace({0: -1})
+
+    return task_df
