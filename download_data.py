@@ -5,7 +5,7 @@ import os
 import sys
 
 # URL of the zip file (hardcoded)
-zip_url = "https://figshare.com/ndownloader/files/48178787?private_link=695c37a72194f4d9cd58"
+zip_url = "https://figshare.com/ndownloader/files/52361057?private_link=4f10754a390dc21f3e6b"
 
 
 def download_and_unzip(url, dest_folder="."):
