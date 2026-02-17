@@ -1,8 +1,8 @@
 # Impaired goal-directed planning in transdiagnostic compulsivity is explained by uncertainty about learned task structure
 
-_Sookud, Martin, Gillan & Wise (2024)_
+_Sookud, Martin, Gillan & Wise (2024) Biological Psychiatry: CNNI_
 
-🔗 [Preprint](https://osf.io/preprints/psyarxiv/zp6vk)
+🔗 [Paper](https://www.biologicalpsychiatrycnni.org/article/S2451-9022(25)00306-4/fulltext)
 
 This repository contains analysis code for the project looking at how transition learning relates to symptoms of mental health problems.
 
